@@ -957,6 +957,9 @@ void G1CollectedHeap::resize_heap_if_necessary_ahs(bool record_expand_time) {
 }
 
 void G1CollectedHeap::refresh_ahs_flags() {
+  if (!EnableAhs) {
+    log_info(ahs)("AHS not enabled, this function is a no-op.");
+  }
   // Early exit if not in a containerized environment.
   if (!OSContainer::is_containerized()) {
     log_info(ahs)("Not in a containerized environment");
@@ -965,41 +968,11 @@ void G1CollectedHeap::refresh_ahs_flags() {
   log_info(ahs)("Refreshing AHS flags");
   ahs_flag_refresh_counter_++;
 
-  // Simplified logic for CurrentMaxExpansionSize (no buffer, etc.)
-  log_info(ahs)("os::available_memory(): " SIZE_FORMAT "B",
-                 os::available_memory());
-  log_info(ahs)("os::physical_memory(): " SIZE_FORMAT "B",
-                 os::physical_memory());
-  log_info(ahs)("OSContainer::memory_limit_in_bytes(): " SIZE_FORMAT "B",
-                OSContainer::memory_limit_in_bytes());
-  log_info(ahs)("OSContainer::memory_usage_in_bytes(): " SIZE_FORMAT "B",
-                 OSContainer::memory_usage_in_bytes());
-
-  const int64_t current_heap_size = capacity();
-  log_info(ahs)("Current heap size: " SIZE_FORMAT "B", current_heap_size);
-
-  // Simplified logic for CurrentMaxExpansionSize (no buffer, etc.)
+  // Simplified logic for CurrentMaxHeapSize
   const int64_t container_limit = OSContainer::memory_limit_in_bytes();
-  const int64_t container_usage = OSContainer::memory_usage_in_bytes();
-  const int64_t free_container_space =
-      fmax(container_limit - container_usage, 0);
-  log_info(ahs)(
-      "New current max heap increase (aka free container space): " SIZE_FORMAT
-      "B",
-      free_container_space);
-  const int64_t maximum_heap_increase_for_container =
-      fmax(container_limit - current_heap_size, 0);
-  log_info(ahs)("container_limit:" SIZE_FORMAT "B", container_limit);
-  const int64_t step_amount = container_limit / 2000.;
-  log_info(ahs)("step_amount: " SIZE_FORMAT "B", step_amount);
-  const int64_t max_expansion =
-      fmin(maximum_heap_increase_for_container, free_container_space) * 0.95;
-  log_info(ahs)(
-      "Max heap increase after multiplying by buffer ratio: " SIZE_FORMAT "B",
-      max_expansion);
-  CurrentMaxExpansionSize = max_expansion;
+  CurrentMaxHeapSize = container_limit * .95;
 
-  // Simplified logic for ProposedHeapSize
+  // Simplified logic for SoftMaxHeapSize
 
   // Early exit condition if we haven't "started up" yet.
   const int64_t current_gc_time =
@@ -1011,7 +984,9 @@ void G1CollectedHeap::refresh_ahs_flags() {
   const int64_t current_cpu_time = tp->tv_sec * NANOSECS_PER_SEC + tp->tv_nsec;
   if (ahs_flag_refresh_counter_ <= 60) {
     log_info(ahs)("refresh counter: " SIZE_FORMAT, ahs_flag_refresh_counter_);
-    ProposedHeapSize = current_heap_size;
+    const int64_t current_heap_size = capacity();
+    log_info(ahs)("Current heap size: " SIZE_FORMAT "B", current_heap_size);
+    SoftMaxHeapSize = current_heap_size;
     ahs_previous_gc_time_ = current_gc_time;
     ahs_previous_total_cpu_time_ = current_cpu_time;
     return;
@@ -1035,13 +1010,15 @@ void G1CollectedHeap::refresh_ahs_flags() {
   log_info(ahs)("Total GC CPU time: " SIZE_FORMAT, total_gc_cpu_time);
   log_info(ahs)("Total CPU time: " SIZE_FORMAT, total_cpu_time);
 
+  const int64_t step_amount = container_limit / 2000.;
+  log_info(ahs)("step_amount: " SIZE_FORMAT "B", step_amount);
   if (gc_cpu_time_ratio < 1.) {
-    ProposedHeapSize -= step_amount;
+    SoftMaxHeapSize -= step_amount;
   } else if (gc_cpu_time_ratio > 1) {
-    ProposedHeapSize += step_amount;
+    SoftMaxHeapSize += step_amount;
   }
 
-  log_info(ahs)("Set ProposedHeapSize to: " SIZE_FORMAT "B", ProposedHeapSize);
+  log_info(ahs)("Set SoftMaxHeapSize to: " SIZE_FORMAT "B", SoftMaxHeapSize);
 }
 
 HeapWord* G1CollectedHeap::satisfy_failed_allocation_helper(size_t word_size,
