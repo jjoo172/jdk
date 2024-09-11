@@ -22,6 +22,8 @@
  *
  */
 
+#include <time.h>
+
 #include "precompiled.hpp"
 #include "classfile/classLoaderDataGraph.hpp"
 #include "classfile/metadataOnStackMark.hpp"
@@ -103,6 +105,7 @@
 #include "oops/access.inline.hpp"
 #include "oops/compressedOops.inline.hpp"
 #include "oops/oop.inline.hpp"
+#include "osContainer_linux.hpp"
 #include "runtime/atomic.hpp"
 #include "runtime/cpuTimeCounters.hpp"
 #include "runtime/handles.inline.hpp"
@@ -341,6 +344,7 @@ size_t G1CollectedHeap::humongous_obj_size_in_regions(size_t word_size) {
 // Otherwise, if can expand, do so.
 // Otherwise, if using ex regions might help, try with ex given back.
 HeapWord* G1CollectedHeap::humongous_obj_allocate(size_t word_size) {
+  refresh_ahs_flags();
   assert_heap_locked_or_at_safepoint(true /* should_be_vm_thread */);
 
   _verifier->verify_region_sets_optional();
@@ -918,6 +922,7 @@ void G1CollectedHeap::resize_heap_if_necessary_non_ahs() {
 }
 
 void G1CollectedHeap::resize_heap_if_necessary_ahs(bool record_expand_time) {
+  refresh_ahs_flags();
   assert(SoftMaxHeapSize > 0,
          "Unexpected call to resize_heap_if_necessary_ahs() when "
          "SoftMaxHeapSize not set!");
@@ -949,6 +954,94 @@ void G1CollectedHeap::resize_heap_if_necessary_ahs(bool record_expand_time) {
         heap_capacity, heap_occupancy, used(), SoftMaxHeapSize);
     shrink(-bytes_to_change);
   }
+}
+
+void G1CollectedHeap::refresh_ahs_flags() {
+  // Early exit if not in a containerized environment.
+  if (!OSContainer::is_containerized()) {
+    log_info(ahs)("Not in a containerized environment");
+    return;
+  }
+  log_info(ahs)("Refreshing AHS flags");
+  ahs_flag_refresh_counter_++;
+
+  // Simplified logic for CurrentMaxExpansionSize (no buffer, etc.)
+  log_info(ahs)("os::available_memory(): " SIZE_FORMAT "B",
+                 os::available_memory());
+  log_info(ahs)("os::physical_memory(): " SIZE_FORMAT "B",
+                 os::physical_memory());
+  log_info(ahs)("OSContainer::memory_limit_in_bytes(): " SIZE_FORMAT "B",
+                OSContainer::memory_limit_in_bytes());
+  log_info(ahs)("OSContainer::memory_usage_in_bytes(): " SIZE_FORMAT "B",
+                 OSContainer::memory_usage_in_bytes());
+
+  const int64_t current_heap_size = capacity();
+  log_info(ahs)("Current heap size: " SIZE_FORMAT "B", current_heap_size);
+
+  // Simplified logic for CurrentMaxExpansionSize (no buffer, etc.)
+  const int64_t container_limit = OSContainer::memory_limit_in_bytes();
+  const int64_t container_usage = OSContainer::memory_usage_in_bytes();
+  const int64_t free_container_space =
+      fmax(container_limit - container_usage, 0);
+  log_info(ahs)(
+      "New current max heap increase (aka free container space): " SIZE_FORMAT
+      "B",
+      free_container_space);
+  const int64_t maximum_heap_increase_for_container =
+      fmax(container_limit - current_heap_size, 0);
+  log_info(ahs)("container_limit:" SIZE_FORMAT "B", container_limit);
+  const int64_t step_amount = container_limit / 2000.;
+  log_info(ahs)("step_amount: " SIZE_FORMAT "B", step_amount);
+  const int64_t max_expansion =
+      fmin(maximum_heap_increase_for_container, free_container_space) * 0.95;
+  log_info(ahs)(
+      "Max heap increase after multiplying by buffer ratio: " SIZE_FORMAT "B",
+      max_expansion);
+  CurrentMaxExpansionSize = max_expansion;
+
+  // Simplified logic for ProposedHeapSize
+
+  // Early exit condition if we haven't "started up" yet.
+  const int64_t current_gc_time =
+      CPUTimeCounters::get_counter(CPUTimeGroups::CPUTimeType::gc_total)
+          ->get_value();
+  timespec* tp;
+  int ret = clock_gettime(CLOCK_PROCESS_CPUTIME_ID, tp);
+  // TODO - use ret.
+  const int64_t current_cpu_time = tp->tv_sec * NANOSECS_PER_SEC + tp->tv_nsec;
+  if (ahs_flag_refresh_counter_ <= 60) {
+    log_info(ahs)("refresh counter: " SIZE_FORMAT, ahs_flag_refresh_counter_);
+    ProposedHeapSize = current_heap_size;
+    ahs_previous_gc_time_ = current_gc_time;
+    ahs_previous_total_cpu_time_ = current_cpu_time;
+    return;
+  }
+
+  // Get GC Information
+  const int64_t prev_gc_time = ahs_previous_gc_time_;
+  ahs_previous_gc_time_ = current_gc_time;
+  const int64_t total_gc_cpu_time = current_gc_time - prev_gc_time;
+  log_info(ahs)("Current gc time: " SIZE_FORMAT, ahs_previous_gc_time_);
+  log_info(ahs)("Current CPU time: " SIZE_FORMAT, ahs_previous_total_cpu_time_);
+
+  // Get total CPU time information
+  const int64_t prev_cpu_time = ahs_previous_total_cpu_time_;
+  ahs_previous_total_cpu_time_ = current_cpu_time;
+  const int64_t total_cpu_time = current_cpu_time - prev_cpu_time;
+
+  const double gc_cpu_time_ratio =
+      static_cast<double>(total_gc_cpu_time) / total_cpu_time;
+
+  log_info(ahs)("Total GC CPU time: " SIZE_FORMAT, total_gc_cpu_time);
+  log_info(ahs)("Total CPU time: " SIZE_FORMAT, total_cpu_time);
+
+  if (gc_cpu_time_ratio < 1.) {
+    ProposedHeapSize -= step_amount;
+  } else if (gc_cpu_time_ratio > 1) {
+    ProposedHeapSize += step_amount;
+  }
+
+  log_info(ahs)("Set ProposedHeapSize to: " SIZE_FORMAT "B", ProposedHeapSize);
 }
 
 HeapWord* G1CollectedHeap::satisfy_failed_allocation_helper(size_t word_size,
@@ -1089,6 +1182,7 @@ bool G1CollectedHeap::expand(size_t expand_bytes, WorkerThreads* pretouch_worker
   // function. It is still possible for the timing of the write to override a
   // more recent CurrentMaxHeapSize value, but this is tolerable for one
   // iteration.
+  refresh_ahs_flags();
   const size_t current_max_expansion_size = CurrentMaxHeapSize - capacity();
   log_debug(ahs)("expand() of size: " SIZE_FORMAT
                  " called with SoftMaxHeapSize: " SIZE_FORMAT
@@ -2510,6 +2604,7 @@ void G1CollectedHeap::verify_after_young_collection(G1HeapVerifier::G1VerifyType
 }
 
 void G1CollectedHeap::expand_heap_after_young_collection(){
+  refresh_ahs_flags();
   int64_t expand_bytes;
   if (SoftMaxHeapSize == 0) {
     expand_bytes = _heap_sizing_policy->young_collection_expansion_amount();

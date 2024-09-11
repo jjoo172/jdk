@@ -560,6 +560,11 @@ public:
   void unpin_object(JavaThread* thread, oop obj) override;
 
   void resize_heap_if_necessary(bool record_expand_time);
+  void refresh_ahs_flags();
+
+  int64_t ahs_flag_refresh_counter_ = 0;
+  int64_t ahs_previous_gc_time_ = 0;
+  int64_t ahs_previous_total_cpu_time_ = 0;
 
   // Check if there is memory to uncommit and if so schedule a task to do it.
   void uncommit_regions_if_necessary();
